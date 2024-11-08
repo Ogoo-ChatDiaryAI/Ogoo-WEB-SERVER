@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Django stuff:
+*.log
+*.pot
+*.pyc
+*.pyo
+*.db
+db.sqlite3
+
+# If using Postgres:
+*.psql
+
+# Environment variables:
+.env
+*.env
+
+# Media files:
+media/
+
+# Node modules:
+node_modules/
+
+# Virtual environment:
+venv/
+ogoo-venv/
