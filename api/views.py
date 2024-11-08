@@ -7,6 +7,7 @@ from django.shortcuts import redirect
 from django.conf import settings
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
+from django.utils import timezone
 from django.contrib.auth import get_user_model, login
 from dotenv import load_dotenv
 import google.generativeai as genai
@@ -15,6 +16,7 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.authentication import (BasicAuthentication,
                                            SessionAuthentication)
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.permissions import (AllowAny, IsAuthenticated) # 테스트 시 AllowAny 추가
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -42,6 +44,7 @@ class KakaoLoginCallbackView(APIView):
     def post(self, request, *args, **kwargs):
         logger.debug(f"Incoming request path: {request.path}")
         logger.debug(f"Incoming request method: {request.method}")
+
         code = request.data.get('code')
         logger.debug(f"Receuved code: {code}")
         if not code:
@@ -106,11 +109,13 @@ class KakaoLoginCallbackView(APIView):
         user, created = User.objects.update_or_create(
             kakao_id=kakao_id,
             defaults={
-                "nickname":nickname
+                "nickname": nickname,
+                "connected_at": timezone.now()
             }
         )
+        logger.debug(f"User created or retrieved: {user}, created: {created}")
 
-        login(request, user, backend='allauth.socialaccount.auth_backends.SocialAccountBackend')
+        request.user = user
 
         # Respond with the Kakao ID
         return Response({
@@ -119,6 +124,7 @@ class KakaoLoginCallbackView(APIView):
             "kakao_id": kakao_id,
             "nickname": nickname,
         }, status=status.HTTP_200_OK)
+
 
 class UserViewSet(viewsets.ModelViewSet):
     """
@@ -169,6 +175,35 @@ class UserViewSet(viewsets.ModelViewSet):
 
 #         serializer = self.get_serializer(chat_session)
 #         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+class KakaoAccessTokenAuthentication(BasicAuthentication):
+    def authenticate(self, request):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header:
+            return None
+        
+        token = auth_header.split(" ")[1]
+        user_info = self.get_user_info(token)
+
+        if user_info is None:
+            raise AuthenticationFailed('Invalid or expired token.')
+
+        kakao_id = user_info.get('id')
+        user, _ = User.objects.get_or_create(kakao_id=kakao_id)
+
+        return (user, None)
+
+    def get_user_info(self, token):
+        user_info_url = "https://kapi.kakao.com/v2/user/me"
+        headers = {
+            "Authorization": f"Bearer {token}"
+        }
+        response = requests.get(user_info_url, headers=headers)
+
+        if response.status_code != 200:
+            return None
+
+        return response.json()  
 
 class SentimentAnalysisViewSet(viewsets.ModelViewSet):
     """
@@ -230,26 +265,20 @@ class SentimentAnalysisViewSet(viewsets.ModelViewSet):
             sentiment_result = response.json()
 
             sentiment = sentiment_result.get('document', {}).get('sentiment', 'neutral')
-            confidence_scores = sentiment_result.get('document', {}).get('confidence', {})
-            positive_confidence = confidence_scores.get('positive', 0)
-            negative_confidence = confidence_scores.get('negative', 0)
-            neutral_confidence = confidence_scores.get('neutral', 0)
+            classified_sentiment = self.classified_sentiment(sentiment)
             
             sentiment_analysis = SentimentAnalysis.objects.create(
                 diary=diary,
                 sentiment=sentiment,
-                score=max(positive_confidence, negative_confidence, neutral_confidence)
+                score=1.0
             )
-
-            classified_sentiment = self.classified_sentiment(semtiment)
-            emoji = self.get_emoji_based_on_sentiment(classified_sentiment)
 
             serializer = self.get_serializer(sentiment_analysis)
             return Response({
                 "message": "Clova 감정 분석 완료",
                 "analysis": serializer.data,
                 "sentiment": classified_sentiment,
-                "emoji": emoji,
+                "emoji": classified_sentiment,
             }, status=status.HTTP_201_CREATED)
         else:
             return Response({"error": "Clova 감정 분석 실패"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -270,7 +299,6 @@ class SentimentAnalysisViewSet(viewsets.ModelViewSet):
         queryset = self.get_queryset()
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
-    
 
 genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 class DiaryViewSet(viewsets.ModelViewSet):
@@ -281,12 +309,14 @@ class DiaryViewSet(viewsets.ModelViewSet):
     serializer_class = DiarySerializer
     # permission_classes = [AllowAny]  # 인증 없이 접근 가능
     # 테스트 이후 사용 (실제 환경에서는 인증 필요)
-    permission_classes = [AllowAny]
+    authentication_classes = [KakaoAccessTokenAuthentication]
+    permission_classes = [IsAuthenticated]
 
     def create(self, request, *args, **kwargs):
-        """
-        채팅 세션의 대화 내용을 받아 Gemini에 일기 생성 요청
-        """
+        if not request.user.is_authenticated:
+            return Response({"error": "User must be authenticated."}, status=status.HTTP_403_FORBIDDEN)
+        
+        """채팅 세션의 대화 내용을 받아 Gemini에 일기 생성 요청"""
         conversation_data = request.data.get("conversation_data")
         if not conversation_data:
             return Response({"error": "Conversation data is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -297,53 +327,84 @@ class DiaryViewSet(viewsets.ModelViewSet):
             f"다음 대화를 바탕으로 User의 입장에서 일기 항목을 작성해 주세요. "
             f"일기에는 제목이 포함되어야 하며 User의 경험과 대화에 대한 생각을 서술해야 합니다. "
             f"결과를 다음 형식으로 작성해 주세요: {{ \"title\": \"일기 제목\", \"content\": \"일기 내용\" }}\n\n"
-            f"{json.dumps(conversation_data, ensure_ascii=False)}"  # Ensure conversation data is properly formatted
+            f"{json.dumps(conversation_data, ensure_ascii=False)}"
         )
-
 
         model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(diary_creation_prompt)
 
-        logger.debug(f"Gemini API response: {response}")  # Log the entire response
-        logger.debug(f"Response type: {type(response)}")  # Log the type of the response
-        if response is not None and hasattr(response, 'result') and response.result.candidates:
-            diary_data = response.result.candidates[0].content.parts[0].text
-            diary_data = diary_data.replace("```json\n", "").replace("```", "").strip()
+        # Log the full response for debugging
+        logger.debug(f"Gemini API response: {response}")
 
-            try:
-                diary_info = json.loads(diary_data)
-                title = diary_info.get('title', '제목없음')
-                content = diary_info.get('content', '')
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON Decode Error: {str(e)} with data: {diary_data}")
-                return Response({"error": f"Failed to parse diary data: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        # Check the response structure
+        if response:
+            logger.debug(f"Response type: {type(response)}")  # Log the type of response
+            logger.debug(f"Full Response: {response}")  # Log the entire response object
 
-            diary = Diary.objects.create(
-                user=request.user,
-                title=title,
-                content=content
-            )
-            
-            sentiment_viewset = SentimentAnalysisViewSet()
-            sentiment_viewset.request = request
-            sentiment_data = {'diary_id': diary.id}
-            sentiment_response = sentiment_viewset.create(request=request, data=sentiment_data)
+            # Check for candidates in the response directly
+            if hasattr(response, 'candidates') and response.candidates:
+                diary_data = response.candidates[0].content.parts[0].text
+                
+                # Log the raw diary data
+                logger.debug(f"Raw diary data from Gemini: {diary_data}")
 
-            sentiment = sentiment_response.data.get('analysis', {}).get('sentiment', 'neutral')
-            emoji = self.get_emoji_based_on_sentiment(sentiment)
+                # Clean the response to remove markdown formatting
+                cleaned_data = diary_data.replace("```json\n", "").replace("```", "").strip()
+                logger.debug(f"Cleaned diary data: {cleaned_data}")  # Log the cleaned data
 
-            return Response({
-                "code": 200,
-                "message": "Diary successfully created by Gemini",
-                "diaryTitle": title,
-                "diaryContent": content,
-                "emoji": emoji
-            }, status=status.HTTP_201_CREATED)
+                try:
+                    # Attempt to parse the cleaned JSON string
+                    diary_info = json.loads(cleaned_data)
+                    title = diary_info.get('title', '제목없음')
+                    content = diary_info.get('content', '')
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON Decode Error: {str(e)} with data: {cleaned_data}")
+                    return Response({"error": f"Failed to parse diary data: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+                # Create the diary entry
+                diary = Diary.objects.create(
+                    user=request.user,
+                    title=title,
+                    content=content
+                )
+
+                # Optional: Perform sentiment analysis immediately after creation
+                sentiment_viewset = SentimentAnalysisViewSet()
+                sentiment_viewset.request = request
+                sentiment_data = {'diary_id': diary.id}
+                sentiment_response = sentiment_viewset.create(request=request, data=sentiment_data)
+
+                # Extract sentiment and corresponding emoji
+                sentiment = sentiment_response.data.get('analysis', {}).get('sentiment', 'neutral')
+                classified_sentiment = self.classified_sentiment(sentiment)
+
+                return Response({
+                    "code": 200,
+                    "message": "Chat ended and diary created",
+                    "diaryTitle": title,
+                    "diaryContent": content,
+                    "emoji": classified_sentiment,
+                    "diaryId": diary.id
+                }, status=status.HTTP_201_CREATED)
+            else:
+                logger.error("No candidates found in the response.")
+                return Response({"error": "No candidates returned from Gemini."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         else:
-            logger.error("Failed to generate diary from Gemini, response was invalid.")
-            logger.error(f"Response details: {response}")
+            logger.error("No response received from Gemini API.")
             return Response({"error": "Failed to generate diary from Gemini"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
+
+    def classified_sentiment(self, sentiment):
+        if sentiment == "positive":
+            return "happy"
+        elif sentiment == "angry":
+            return "angry"
+        elif sentiment == "sad":
+            return "sad"
+        elif sentiment == "fear":
+            return "fear"
+        else:
+            return "neutral"
+
     @action(detail=False, methods=['post'], url_path='save')
     def save_diary(self, request):
         diary_id = request.data.get('diary_id')
@@ -355,36 +416,63 @@ class DiaryViewSet(viewsets.ModelViewSet):
         except Diary.DoesNotExist:
             return Response({"error": "Diary not found"}, status=status.HTTP_404_NOT_FOUND)
 
+        # Prepare the updated diary data
         diary_data = {
-            "user": request.user.id,
             "title": title,
             "content": content
         }
 
         serializer = self.get_serializer(diary, data=diary_data, partial=True)
-
         if serializer.is_valid():
+            # Save the diary updates
             serializer.save()
 
-            sentiment_viewset = SentimentAnalysisViewSet()
-            sentiment_viewset.request = request
-            sentiment_data = {'diary_id': diary.id}
+            # Now perform sentiment analysis on the updated content
+            clova_api_url = "https://naveropenapi.apigw.ntruss.com/sentiment-analysis/v1/analyze"
+            headers = {
+                "X-NCP-APIGW-API-KEY-ID": os.getenv('CLOVA_API_KEY_ID'),
+                "X-NCP-APIGW-API-KEY": os.getenv('CLOVA_API_KEY'),
+                "Content-Type": "application/json"
+            }
+            data = {
+                "content": content,
+                "config": {
+                    "negativeClassification": True
+                }
+            }
+            response = requests.post(clova_api_url, headers=headers, json=data)
 
-            if hasattr(diary, 'sentiment_analysis'):
-                sentiment_response = sentiment_viewset.update(request=request, data=sentiment_data)
+            if response.status_code == 200:
+                sentiment_result = response.json()
+                sentiment = sentiment_result.get('document', {}).get('sentiment', 'neutral')
+                confidence_scores = sentiment_result.get('document', {}).get('confidence', {})
+                positive_confidence = confidence_scores.get('positive', 0)
+                negative_confidence = confidence_scores.get('negative', 0)
+                neutral_confidence = confidence_scores.get('neutral', 0)
+
+                # Check if a SentimentAnalysis entry already exists for this diary
+                sentiment_analysis, created = SentimentAnalysis.objects.update_or_create(
+                    diary=diary,
+                    defaults={
+                        'sentiment': sentiment,
+                        'score': max(positive_confidence, negative_confidence, neutral_confidence)
+                    }
+                )
+
+                return Response({
+                    "message": "Diary saved successfully",
+                    "diary": serializer.data,
+                    "sentiment_analysis": {
+                        "sentiment": sentiment,
+                        "score": max(positive_confidence, negative_confidence, neutral_confidence)
+                    }
+                }, status=status.HTTP_200_OK)
             else:
-                sentiment_response = sentiment_viewset.create(request=request, data=sentiment_data)
+                return Response({"error": "Clova sentiment analysis failed"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-            sentiment = sentiment_response.data.get('analysis', {}).get('sentiment', 'neutral')
-            emoji = self.get_emoji_based_on_sentiment(sentiment)
-
-            return Response({
-                "message": "Diary saved successfully", 
-                "diary": serializer.data,
-                "sentiment_analysis": sentiment_response.data,
-                "emoji": emoji,
-            }, status=status.HTTP_200_OK)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
 
     def list(self, request, *args, **kwargs):
         queryset = self.get_queryset()

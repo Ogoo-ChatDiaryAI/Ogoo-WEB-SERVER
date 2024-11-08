@@ -64,7 +64,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     REQUIRED_FIELDS = []
 
     def __str__(self):
-        return self.kakao_id if self.kakao_id else "No Kakao ID"
+        return str(self.kakao_id) if self.kakao_id else "No Kakao ID"
 
     @property
     def is_staff(self):
