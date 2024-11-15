@@ -265,7 +265,7 @@ class SentimentAnalysisViewSet(viewsets.ModelViewSet):
             sentiment_result = response.json()
 
             sentiment = sentiment_result.get('document', {}).get('sentiment', 'neutral')
-            classified_sentiment = self.classified_sentiment(sentiment)
+            classified_sentiment = self.classified_sentiment(sentiment, 'neutral')
             
             sentiment_analysis = SentimentAnalysis.objects.create(
                 diary=diary,
@@ -286,8 +286,8 @@ class SentimentAnalysisViewSet(viewsets.ModelViewSet):
     def classified_sentiment(self, sentiment):
         if sentiment == "positive":
             return "happy"
-        elif sentiment == "angry":
-            return "angry"
+        elif sentiment == "anger":
+            return "anger"
         elif sentiment == "sad":
             return "sad"
         elif sentiment == "fear":
@@ -317,7 +317,7 @@ class DiaryViewSet(viewsets.ModelViewSet):
             return Response({"error": "User must be authenticated."}, status=status.HTTP_403_FORBIDDEN)
         
         """채팅 세션의 대화 내용을 받아 Gemini에 일기 생성 요청"""
-        conversation_data = request.data.get("conversation_data")
+        conversation_data = request.data.get("conversation")
         if not conversation_data:
             return Response({"error": "Conversation data is required."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -368,22 +368,58 @@ class DiaryViewSet(viewsets.ModelViewSet):
                     content=content
                 )
 
-                # Optional: Perform sentiment analysis immediately after creation
-                sentiment_viewset = SentimentAnalysisViewSet()
-                sentiment_viewset.request = request
-                sentiment_data = {'diary_id': diary.id}
-                sentiment_response = sentiment_viewset.create(request=request, data=sentiment_data)
+            clova_api_url = "https://naveropenapi.apigw.ntruss.com/sentiment-analysis/v1/analyze"
+            headers = {
+                "X-NCP-APIGW-API-KEY-ID": os.getenv('CLOVA_API_KEY_ID'),
+                "X-NCP-APIGW-API-KEY": os.getenv('CLOVA_API_KEY'),
+                "Content-Type": "application/json"
+            }
 
-                # Extract sentiment and corresponding emoji
-                sentiment = sentiment_response.data.get('analysis', {}).get('sentiment', 'neutral')
-                classified_sentiment = self.classified_sentiment(sentiment)
+            data = {
+                "content": content,
+                "config": {
+                    "negativeClassification": True
+                }
+            }
+
+            response = requests.post(clova_api_url, headers=headers, json=data)
+
+            if response.status_code == 200:
+                sentiment_result = response.json()
+                sentiment = sentiment_result.get('document', {}).get('sentiment', 'neutral')
+                
+                # Check if negative sentiment exists
+                negative_sentiment = sentiment_result.get('sentences', [{}])[0].get('negativeSentiment', {}).get('sentiment', None)
+                if negative_sentiment:
+                    sentiment = negative_sentiment
+
+                confidence_scores = sentiment_result.get('document', {}).get('confidence', {})
+                positive_confidence = confidence_scores.get('positive', 0)
+                negative_confidence = confidence_scores.get('negative', 0)
+                neutral_confidence = confidence_scores.get('neutral', 0)
+
+                emoji = self.classified_sentiment(sentiment)
+
+                # Save the sentiment analysis result
+                sentiment_analysis, created = SentimentAnalysis.objects.update_or_create(
+                    diary=diary,
+                    defaults={
+                        'sentiment': sentiment,
+                        'score': max(positive_confidence, negative_confidence, neutral_confidence)
+                    }
+                )
 
                 return Response({
                     "code": 200,
                     "message": "Chat ended and diary created",
                     "diaryTitle": title,
                     "diaryContent": content,
-                    "emoji": classified_sentiment,
+                    "emoji": emoji,
+                    "sentiment_analysis": {
+                        "sentiment": sentiment,
+                        "score": max(positive_confidence, negative_confidence, neutral_confidence),
+                        "negativeSentiment": negative_sentiment if negative_sentiment else "None"  # Include negative sentiment
+                    },
                     "diaryId": diary.id
                 }, status=status.HTTP_201_CREATED)
             else:
@@ -409,7 +445,7 @@ class DiaryViewSet(viewsets.ModelViewSet):
     def save_diary(self, request):
         diary_id = request.data.get('diary_id')
         title = request.data.get('title')
-        content = request.data.get('content')
+        content = request.data.get('diaryContent')
 
         try:
             diary = Diary.objects.get(id=diary_id, user=request.user)
@@ -445,10 +481,17 @@ class DiaryViewSet(viewsets.ModelViewSet):
             if response.status_code == 200:
                 sentiment_result = response.json()
                 sentiment = sentiment_result.get('document', {}).get('sentiment', 'neutral')
+
+                negative_sentiment = sentiment_result.get('sentences', [{}])[0].get('negativeSentiment', {}).get('sentiment', None)
+                if negative_sentiment:
+                    sentiment = negative_sentiment
+
                 confidence_scores = sentiment_result.get('document', {}).get('confidence', {})
                 positive_confidence = confidence_scores.get('positive', 0)
                 negative_confidence = confidence_scores.get('negative', 0)
                 neutral_confidence = confidence_scores.get('neutral', 0)
+
+                emoji = self.classified_sentiment(sentiment)
 
                 # Check if a SentimentAnalysis entry already exists for this diary
                 sentiment_analysis, created = SentimentAnalysis.objects.update_or_create(
@@ -464,7 +507,9 @@ class DiaryViewSet(viewsets.ModelViewSet):
                     "diary": serializer.data,
                     "sentiment_analysis": {
                         "sentiment": sentiment,
-                        "score": max(positive_confidence, negative_confidence, neutral_confidence)
+                        "score": max(positive_confidence, negative_confidence, neutral_confidence),
+                        "emoji": emoji,
+                        "negativeSentimnet": negative_sentiment
                     }
                 }, status=status.HTTP_200_OK)
             else:
@@ -472,26 +517,50 @@ class DiaryViewSet(viewsets.ModelViewSet):
 
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-
-
     def list(self, request, *args, **kwargs):
         queryset = self.get_queryset()
         serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
 
-    def retrieve(self, request, *args, **kwargs):
-        instance = self.get_object()
-        serializer = self.get_serializer(instance)
-        return Response(serializer.data)
+        diaries_data = []
 
-    def update(self, request, *args, **kwargs):
-        partial = kwargs.pop('partial', False)
-        instance = self.get_object()
-        serializer = self.get_serializer(instance, data=request.data, partial=partial)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data)
+        for diary in serializer.data:
+            diary_data = {
+                "diaryId": diary['id'],
+                "title": diary['title'],
+                "date": diary['created_at'].split("T")[0],
+                "content": diary['content'],
+            }
+
+            sentiment_analysis = SentimentAnalysis.objects.filter(diary=diary['id']).first()
+            if sentiment_analysis:
+                sentiment = sentiment_analysis.sentiment
+                emoji = self.classified_sentiment(sentiment)
+            else:
+                sentiment = 'neutral'
+                emoji = 'neutral'
+
+            diary_data['emoji'] = emoji
+            diaries_data.append(diary_data)
+        return Response({
+            "code": 200,
+            "diaries": diaries_data
+        }, status=status.HTTP_200_OK)
+
+    def retrieve(self, request, *args, **kwargs):        
+        instance = self.get_object()        
+        serializer = self.get_serializer(instance)        
+        return Response(serializer.data)    
+    
+    def update(self, request, *args, **kwargs):        
+        partial = kwargs.pop('partial', False)        
+        instance = self.get_object()        
+        serializer = self.get_serializer(instance, data=request.data, partial=True)        
+        if serializer.is_valid():            
+            serializer.save()            
+            return Response(serializer.data)        
+        
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
 
         # Mock된 응답 (Gemini API 호출 대신 임시 데이터 반환)
         # mock_gemini_response = {
